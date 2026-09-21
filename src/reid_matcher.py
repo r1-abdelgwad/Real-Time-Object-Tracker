@@ -1,26 +1,28 @@
 """
-Re-Identification (Re-ID) & Feature Matching Module
-===================================================
-Author  : Rawan Abdelgwad
-Date    : 2026
+Re-Identification (Re-ID) Module
+=================================
+Author : Rawan Abdelgwad
+Date   : 2026
 
-Pipeline (two-stage verification):
-  Stage 1 – ORB Feature Matching
-    Extracts binary ORB descriptors from the reference ROI and matches them
-    against the current frame using BFMatcher + Lowe's ratio test.
-    Homography (RANSAC) or centroid estimation locates the candidate bbox.
+Architecture — Two-Path Recovery with HSV Gating
+-------------------------------------------------
+Path A  (primary)  : ORB + BFMatcher + Lowe Ratio Test + RANSAC Homography
+Path B  (fallback) : Multi-scale Template Matching against template history
 
-  Stage 2 – HSV Color Histogram Verification  ← NEW
-    After Stage 1 proposes a candidate bbox, its HSV hue-saturation
-    histogram is compared against the reference ROI histogram.
-    Candidates whose color distribution diverges too far are rejected,
-    preventing false recoveries on visually similar but differently
-    colored objects (e.g. a red cup vs a green bottle nearby).
+Both paths are gated by an HSV colour-histogram check before accepting
+a candidate.  This prevents recovering onto an object that has similar
+texture/edges but a different colour.
 
-Why two stages?
-  ORB matches texture/edges → can match wrong objects with similar texture.
-  HSV histograms capture color identity → filters colour-similar impostors.
-  Together they significantly reduce false-positive recoveries.
+Combined confidence score
+    Path A :  0.65 * orb_score  + 0.35 * hsv_score
+    Path B :  0.50 * tmpl_score + 0.50 * hsv_score
+A recovery is only accepted when combined_confidence >= RECOVERY_THRESHOLD.
+
+Appearance drift protection
+    Templates are only added to history when update_profile() is called
+    with confidence >= PROFILE_UPDATE_MIN_CONF.  ORB reference descriptors
+    and the HSV reference histogram are NEVER overwritten after the initial
+    selection — this anchors identity regardless of lighting changes.
 """
 
 import cv2
@@ -28,218 +30,324 @@ import numpy as np
 
 
 class ReIDMatcher:
-    # ── Histogram verification threshold ──────────────────────────────
-    # Correlation ranges from 0.0 (no match) to 1.0 (perfect match).
-    # 0.55 is a balanced threshold: strict enough to reject similar-colour
-    # neighbours, lenient enough to tolerate lighting changes.
-    HIST_CORR_THRESHOLD = 0.55
+    # ── Tunable thresholds ─────────────────────────────────────────────────
+    ORB_FEATURES            = 500    # max ORB keypoints in reference ROI
+    MIN_ORB_MATCHES         = 8      # good matches needed to attempt homography
+    RATIO_THRESHOLD         = 0.72   # Lowe ratio test (lower = stricter)
+    MIN_INLIER_RATIO        = 0.30   # RANSAC inliers / good_matches floor
+    HSV_CORR_THRESHOLD      = 0.50   # min HSV correlation to accept candidate
+    TEMPLATE_THRESHOLD      = 0.50   # min TM_CCOEFF_NORMED score to attempt HSV check
+    RECOVERY_THRESHOLD      = 0.52   # min combined confidence to confirm recovery
+    MAX_TEMPLATES           = 5      # template history depth (FIFO)
+    PROFILE_UPDATE_MIN_CONF = 0.75   # min confidence required to add a new template
+    TEMPLATE_SCALES         = [0.75, 0.875, 1.0, 1.125, 1.25]  # multi-scale search
 
-    def __init__(self, max_features=500, min_good_matches=6, ratio_threshold=0.75):
-        self.max_features      = max_features
-        self.min_good_matches  = min_good_matches
-        self.ratio_threshold   = ratio_threshold
-
-        self.orb = cv2.ORB_create(nfeatures=self.max_features)
+    # ── Constructor ────────────────────────────────────────────────────────
+    def __init__(self):
+        # ORB detector + Brute-Force matcher (Hamming distance for binary descriptors)
+        self.orb = cv2.ORB_create(nfeatures=self.ORB_FEATURES)
         self.bf  = cv2.BFMatcher(cv2.NORM_HAMMING)
 
-        # Stage 1: ORB reference data
-        self.ref_keypoints   = []
-        self.ref_descriptors = None
+        # ORB reference (set once at selection, never overwritten)
+        self.ref_keypoints   = None   # list[KeyPoint]
+        self.ref_descriptors = None   # ndarray shape (N, 32), dtype uint8
         self.ref_w           = 0
         self.ref_h           = 0
 
-        # Stage 2: HSV histogram reference  ← NEW
+        # HSV reference histogram (set once at selection, never overwritten)
         self.ref_hist = None
 
-    # ─────────────────────────────────────────────────────────────────
-    #  REFERENCE EXTRACTION
-    # ─────────────────────────────────────────────────────────────────
+        # Template history: list of BGR patches, newest first
+        # Starts with the initial ROI; updated by update_profile()
+        self.template_history = []
+
+    # ── Initial feature extraction ─────────────────────────────────────────
     def extract_reference_features(self, frame, bbox):
         """
-        Extract ORB descriptors AND HSV histogram from the initial ROI.
-        Both are stored for two-stage verification during recovery.
+        Called once when the user selects the target.
+        Extracts ORB descriptors, HSV histogram, and initial template — all
+        stored as immutable identity anchors (never overwritten after this).
         """
         x, y, w, h = [int(v) for v in bbox]
-        frame_h, frame_w = frame.shape[:2]
-
-        x1, y1 = max(0, x), max(0, y)
-        x2, y2 = min(frame_w, x + w), min(frame_h, y + h)
+        fh, fw = frame.shape[:2]
+        x1, y1 = max(0, x),     max(0, y)
+        x2, y2 = min(fw, x + w), min(fh, y + h)
 
         roi = frame[y1:y2, x1:x2]
         if roi.size == 0:
-            self.ref_keypoints, self.ref_descriptors = [], None
-            self.ref_hist = None
-            self.ref_w, self.ref_h = w, h
             return
 
-        # Stage 1 reference: ORB keypoints + descriptors
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        self.ref_keypoints, self.ref_descriptors = self.orb.detectAndCompute(gray_roi, None)
-        self.ref_w = w
-        self.ref_h = h
+        # --- ORB reference (primary Re-ID signal) ---
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        self.ref_keypoints, self.ref_descriptors = self.orb.detectAndCompute(gray, None)
+        self.ref_w = x2 - x1
+        self.ref_h = y2 - y1
 
-        # Stage 2 reference: HSV hue-saturation histogram  ← NEW
+        # --- HSV histogram reference (colour gate) ---
         self.ref_hist = self._compute_hsv_hist(roi)
 
-    # ─────────────────────────────────────────────────────────────────
-    #  HSV HISTOGRAM HELPERS  ← NEW
-    # ─────────────────────────────────────────────────────────────────
+        # --- Initial template (Path B seed) ---
+        self.template_history = [roi.copy()]
+
+    # ── Profile update (appearance drift protection) ───────────────────────
+    def update_profile(self, frame, bbox, confidence):
+        """
+        Append a new template patch to history only when tracking is stable.
+        Called by tracker.py on a fixed interval with a confidence value.
+
+        Rules:
+          - Confidence must be >= PROFILE_UPDATE_MIN_CONF.
+          - ORB descriptors and HSV histogram are NEVER updated here.
+            Updating them risks drifting the identity anchor.
+          - Only templates drift (slightly) to adapt to slow appearance changes.
+        """
+        if confidence < self.PROFILE_UPDATE_MIN_CONF:
+            return
+
+        x, y, w, h = [int(v) for v in bbox]
+        fh, fw = frame.shape[:2]
+        x1, y1 = max(0, x),     max(0, y)
+        x2, y2 = min(fw, x + w), min(fh, y + h)
+        patch = frame[y1:y2, x1:x2]
+        if patch.size == 0:
+            return
+
+        self.template_history.insert(0, patch.copy())        # newest first
+        if len(self.template_history) > self.MAX_TEMPLATES:
+            self.template_history.pop()                       # drop oldest
+
+    # ── HSV histogram helpers ──────────────────────────────────────────────
     @staticmethod
     def _compute_hsv_hist(bgr_roi):
         """
-        Compute a normalised 2D hue-saturation histogram from a BGR image patch.
-
-        Using H+S (not V) makes the histogram invariant to brightness changes,
-        so the comparison stays valid under different lighting conditions.
-
-        Bins: 30 hue bins × 32 saturation bins = 960 total bins.
+        2-D Hue-Saturation histogram (30 x 32 bins), L2-normalised.
+        Value channel excluded — makes the histogram robust to lighting changes.
         """
-        hsv = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist(
-            [hsv], [0, 1], None,
-            [30, 32],
-            [0, 180, 0, 256]
-        )
+        hsv  = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
         cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
         return hist
 
-    def _verify_color(self, frame, candidate_bbox):
+    def _verify_hsv(self, frame, bbox):
         """
-        Stage 2: Compare the candidate region's HSV histogram against the
-        reference histogram using correlation metric.
+        Compute HSV histogram of the candidate region and compare it against
+        the reference using Pearson correlation.
 
-        Returns True only if the color similarity exceeds HIST_CORR_THRESHOLD.
-        Returns True unconditionally when no reference histogram exists
-        (fallback to ORB-only mode so the tracker still works).
+        Returns float in [0, 1].  Returns 1.0 if no reference exists (bypass).
         """
         if self.ref_hist is None:
-            return True  # No reference → skip colour check
+            return 1.0
 
-        x, y, w, h = [int(v) for v in candidate_bbox]
-        frame_h, frame_w = frame.shape[:2]
-
-        # Clamp to frame bounds
-        x1, y1 = max(0, x), max(0, y)
-        x2, y2 = min(frame_w, x + w), min(frame_h, y + h)
-
+        x, y, w, h = [int(v) for v in bbox]
+        fh, fw = frame.shape[:2]
+        x1, y1 = max(0, x),     max(0, y)
+        x2, y2 = min(fw, x + w), min(fh, y + h)
         if x2 <= x1 or y2 <= y1:
-            return False
+            return 0.0
 
-        cand_roi  = frame[y1:y2, x1:x2]
-        if cand_roi.size == 0:
-            return False
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return 0.0
 
-        cand_hist = self._compute_hsv_hist(cand_roi)
+        cand_hist   = self._compute_hsv_hist(roi)
         correlation = cv2.compareHist(self.ref_hist, cand_hist, cv2.HISTCMP_CORREL)
+        return max(0.0, float(correlation))
 
-        return correlation >= self.HIST_CORR_THRESHOLD
+    # ── Path A: ORB matching ───────────────────────────────────────────────
+    def _match_orb(self, frame):
+        """
+        Full ORB pipeline:
+          1. Detect + compute descriptors in current frame.
+          2. knn-match against stored reference descriptors.
+          3. Filter with Lowe ratio test.
+          4. Estimate location via RANSAC Homography.
+          5. Fallback to keypoint centroid if Homography degenerates.
 
-    # ─────────────────────────────────────────────────────────────────
-    #  BBOX VALIDATION
-    # ─────────────────────────────────────────────────────────────────
-    def validate_bbox(self, candidate_bbox, frame_shape):
-        """Validate candidate bounding box bounds and scale ratios."""
-        if candidate_bbox is None:
+        Returns:
+          bbox  (tuple|None)  : (x, y, w, h) candidate
+          score (float)       : normalised score in [0, 1]
+          n_good (int)        : number of good matches (for logging)
+        """
+        if self.ref_descriptors is None or len(self.ref_descriptors) < 4:
+            return None, 0.0, 0
+
+        gray      = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_kp, frame_des = self.orb.detectAndCompute(gray, None)
+
+        if frame_des is None or len(frame_des) < 2:
+            return None, 0.0, 0
+
+        # knn match + Lowe ratio test
+        raw_matches = self.bf.knnMatch(self.ref_descriptors, frame_des, k=2)
+        good = []
+        for tup in raw_matches:
+            if len(tup) == 2:
+                m, n = tup
+                if m.distance < self.RATIO_THRESHOLD * n.distance:
+                    good.append(m)
+
+        n_good = len(good)
+        if n_good < self.MIN_ORB_MATCHES:
+            return None, 0.0, n_good
+
+        src_pts = np.float32(
+            [self.ref_keypoints[m.queryIdx].pt for m in good]
+        ).reshape(-1, 1, 2)
+        dst_pts = np.float32(
+            [frame_kp[m.trainIdx].pt for m in good]
+        ).reshape(-1, 1, 2)
+
+        # RANSAC Homography
+        try:
+            H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+            if H is not None and mask is not None:
+                n_inliers    = int(mask.sum())
+                inlier_ratio = n_inliers / n_good
+
+                if inlier_ratio >= self.MIN_INLIER_RATIO:
+                    corners = np.float32([
+                        [0,          0         ],
+                        [self.ref_w, 0         ],
+                        [self.ref_w, self.ref_h],
+                        [0,          self.ref_h],
+                    ]).reshape(-1, 1, 2)
+                    dst_corners = cv2.perspectiveTransform(corners, H)
+                    xs, ys = dst_corners[:, 0, 0], dst_corners[:, 0, 1]
+
+                    x_min, x_max = float(xs.min()), float(xs.max())
+                    y_min, y_max = float(ys.min()), float(ys.max())
+                    bbox  = (int(x_min), int(y_min),
+                             int(x_max - x_min), int(y_max - y_min))
+                    # score: normalised match count * inlier quality
+                    score = min(1.0, n_good / 30.0) * inlier_ratio
+                    return bbox, score, n_good
+        except cv2.error:
+            pass
+
+        # Centroid fallback (homography failed / degenerate)
+        coords  = dst_pts.reshape(-1, 2)
+        cx, cy  = float(np.median(coords[:, 0])), float(np.median(coords[:, 1]))
+        bbox    = (int(cx - self.ref_w / 2), int(cy - self.ref_h / 2),
+                   self.ref_w, self.ref_h)
+        score   = min(1.0, n_good / 30.0) * 0.45    # discounted: no geometric check
+        return bbox, score, n_good
+
+    # ── Path B: Template matching ──────────────────────────────────────────
+    def _match_template(self, frame):
+        """
+        Multi-scale template matching over the full template history.
+        Tries TEMPLATE_SCALES of each stored template.
+        Uses TM_CCOEFF_NORMED (range -1 to 1; higher = better).
+
+        Returns:
+          bbox  (tuple|None) : (x, y, w, h) best candidate
+          score (float)      : best normalised match score in [0, 1]
+        """
+        if not self.template_history:
+            return None, 0.0
+
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        fh, fw     = frame.shape[:2]
+
+        best_score = -1.0
+        best_bbox  = None
+
+        for tmpl_bgr in self.template_history:
+            gray_tmpl  = cv2.cvtColor(tmpl_bgr, cv2.COLOR_BGR2GRAY)
+            if gray_tmpl.std() < 2.0:
+                continue
+            th, tw     = gray_tmpl.shape
+
+            for scale in self.TEMPLATE_SCALES:
+                nw = max(10, int(tw * scale))
+                nh = max(10, int(th * scale))
+
+                # Template must be smaller than frame
+                if nw >= fw or nh >= fh:
+                    continue
+
+                scaled = cv2.resize(gray_tmpl, (nw, nh))
+
+                try:
+                    result  = cv2.matchTemplate(gray_frame, scaled,
+                                                cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+                    if max_val > best_score:
+                        best_score = max_val
+                        best_bbox  = (max_loc[0], max_loc[1], nw, nh)
+                except cv2.error:
+                    continue
+
+        # Normalise from [-1, 1] to [0, 1]
+        normalised_score = max(0.0, float(best_score))
+        return best_bbox, normalised_score
+
+    # ── Bbox validation ────────────────────────────────────────────────────
+    def validate_bbox(self, bbox, frame_shape):
+        """
+        Reject geometrically implausible candidates.
+        Checks: minimum size, within-frame bounds, scale ratio vs reference.
+        """
+        if bbox is None:
             return False
 
-        x, y, w, h = candidate_bbox
-        frame_h, frame_w = frame_shape[:2]
+        x, y, w, h = bbox
+        fh, fw     = frame_shape[:2]
 
         if w < 10 or h < 10:
             return False
 
-        if x < -w or y < -h or x > frame_w or y > frame_h:
+        # Allow partial off-screen presence (object near edge)
+        if x < -w or y < -h or x > fw or y > fh:
             return False
 
         ref_area   = max(1.0, float(self.ref_w * self.ref_h))
         cand_area  = float(w * h)
-        scale_ratio = cand_area / ref_area
+        scale      = cand_area / ref_area
 
-        if scale_ratio < 0.2 or scale_ratio > 4.5:
+        # Reject if scale is wildly different (0.15x to 5x of reference area)
+        if not (0.15 <= scale <= 5.0):
             return False
 
         return True
 
-    # ─────────────────────────────────────────────────────────────────
-    #  MAIN RECOVERY FUNCTION
-    # ─────────────────────────────────────────────────────────────────
+    # ── Main recovery entry point ──────────────────────────────────────────
     def recover_object(self, frame):
         """
-        Two-stage object recovery:
-          1. ORB feature matching → candidate bounding box.
-          2. HSV histogram comparison → colour identity check.
+        Attempt to relocate the lost target in the given frame.
+
+        Path A (ORB) runs first — it is more precise.
+        Path B (Template) runs as fallback when ORB has too few features
+        (e.g. featureless/uniform-colour objects).
+        Both paths are gated by HSV colour verification.
 
         Returns:
-          (recovered: bool, bbox: tuple|None, match_count: int)
+          recovered   (bool)        : True if a valid candidate was found
+          bbox        (tuple|None)  : (x, y, w, h) of recovered location
+          confidence  (float)       : combined score in [0, 1]
+          method      (str)         : 'ORB' | 'Template' | 'None'
         """
-        if self.ref_descriptors is None or len(self.ref_descriptors) < 4:
-            return False, None, 0
+        # ── Path A: ORB ────────────────────────────────────────────────────
+        orb_bbox, orb_score, n_good = self._match_orb(frame)
 
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        frame_kp, frame_des = self.orb.detectAndCompute(gray_frame, None)
+        if orb_bbox is not None and self.validate_bbox(orb_bbox, frame.shape):
+            hsv_score  = self._verify_hsv(frame, orb_bbox)
+            if hsv_score >= self.HSV_CORR_THRESHOLD:
+                confidence = 0.65 * orb_score + 0.35 * hsv_score
+                if confidence >= self.RECOVERY_THRESHOLD:
+                    return True, orb_bbox, confidence, "ORB"
 
-        if frame_des is None or len(frame_des) < 2:
-            return False, None, 0
+        # ── Path B: Template matching (fallback) ───────────────────────────
+        tmpl_bbox, tmpl_score = self._match_template(frame)
 
-        # ── Stage 1: ORB ratio-test matching ──────────────────────────
-        matches = self.bf.knnMatch(self.ref_descriptors, frame_des, k=2)
+        if (tmpl_bbox is not None
+                and tmpl_score >= self.TEMPLATE_THRESHOLD
+                and self.validate_bbox(tmpl_bbox, frame.shape)):
+            hsv_score  = self._verify_hsv(frame, tmpl_bbox)
+            if hsv_score >= self.HSV_CORR_THRESHOLD:
+                confidence = 0.50 * tmpl_score + 0.50 * hsv_score
+                if confidence >= self.RECOVERY_THRESHOLD:
+                    return True, tmpl_bbox, confidence, "Template"
 
-        good_matches = []
-        for m_tuple in matches:
-            if len(m_tuple) == 2:
-                m, n = m_tuple
-                if m.distance < self.ratio_threshold * n.distance:
-                    good_matches.append(m)
-
-        match_count = len(good_matches)
-        if match_count < self.min_good_matches:
-            return False, None, match_count
-
-        src_pts = np.float32([self.ref_keypoints[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        dst_pts = np.float32([frame_kp[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-
-        # Method A: Homography RANSAC → most accurate
-        try:
-            H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-            if H is not None:
-                pts = np.float32([
-                    [0,          0         ],
-                    [self.ref_w, 0         ],
-                    [self.ref_w, self.ref_h],
-                    [0,          self.ref_h]
-                ]).reshape(-1, 1, 2)
-                dst_corners = cv2.perspectiveTransform(pts, H)
-
-                x_min = float(np.min(dst_corners[:, 0, 0]))
-                y_min = float(np.min(dst_corners[:, 0, 1]))
-                x_max = float(np.max(dst_corners[:, 0, 0]))
-                y_max = float(np.max(dst_corners[:, 0, 1]))
-
-                cand_bbox = (int(x_min), int(y_min),
-                             int(x_max - x_min), int(y_max - y_min))
-
-                # ── Stage 2: Colour histogram gate ──────────────────────
-                if self.validate_bbox(cand_bbox, frame.shape):
-                    if self._verify_color(frame, cand_bbox):
-                        return True, cand_bbox, match_count
-                    else:
-                        # Colour mismatch → reject this candidate silently
-                        return False, None, match_count
-        except cv2.error:
-            pass
-
-        # Method B: Centroid estimation → fallback when homography fails
-        dst_coords = dst_pts.reshape(-1, 2)
-        center_x   = float(np.median(dst_coords[:, 0]))
-        center_y   = float(np.median(dst_coords[:, 1]))
-
-        cand_x    = int(center_x - self.ref_w / 2.0)
-        cand_y    = int(center_y - self.ref_h / 2.0)
-        cand_bbox = (cand_x, cand_y, int(self.ref_w), int(self.ref_h))
-
-        # ── Stage 2: Colour histogram gate (centroid fallback) ──────────
-        if self.validate_bbox(cand_bbox, frame.shape):
-            if self._verify_color(frame, cand_bbox):
-                return True, cand_bbox, match_count
-
-        return False, None, match_count
+        return False, None, 0.0, "None"
