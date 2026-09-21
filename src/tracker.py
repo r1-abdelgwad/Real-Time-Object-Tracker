@@ -17,9 +17,18 @@ import numpy as np
 import sys
 import os
 
-# Enable importing from local src directory
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from reid_matcher import ReIDMatcher
+# Enable robust importing from local src directory regardless of working directory
+src_dir = os.path.dirname(os.path.abspath(__file__))
+if src_dir not in sys.path:
+    sys.path.insert(0, src_dir)
+
+try:
+    from reid_matcher import ReIDMatcher
+except ImportError:
+    try:
+        from src.reid_matcher import ReIDMatcher
+    except ImportError:
+        raise RuntimeError("Could not import reid_matcher module. Ensure src/reid_matcher.py exists.")
 
 # ─────────────────────────────────────────────
 #  STATE MACHINE & CONFIGURATION CONSTANTS
@@ -68,10 +77,22 @@ def create_tracker():
 #  CAMERA & FRAME HELPERS
 # ─────────────────────────────────────────────
 def open_camera(camera_index=0):
-    """Open webcam capture."""
-    cap = cv2.VideoCapture(camera_index)
+    """
+    Open webcam capture with DirectShow fallback for Windows stability.
+    """
+    # 1. Try DirectShow backend on Windows (fastest & most stable)
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera (index={camera_index}).")
+        # 2. Fallback to default OpenCV camera backend
+        cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        # 3. Try secondary camera index 1 if 0 is unavailable
+        cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"Cannot open camera (index={camera_index}).\n"
+            "Check that your webcam is connected and not used by another app."
+        )
     return cap
 
 
