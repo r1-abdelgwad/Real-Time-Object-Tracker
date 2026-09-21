@@ -1,29 +1,34 @@
-# Real-Time Object Tracker
+# Real-Time Object Tracker (CSRT + ORB Re-Detection)
 
-A real-time single-object tracker built with Python and OpenCV using the CSRT (Channel and Spatial Reliability Tracking) algorithm. The user selects an object in the first frame using a mouse-drawn bounding box, and the tracker follows it across subsequent frames from a live webcam feed.
+A real-time single-object tracking and automatic recovery application built with Python and OpenCV using a **Hybrid CSRT + ORB Re-Detection** architecture. The user selects a target object using a mouse-drawn bounding box, and the system tracks it continuously in real time. If the object is temporarily lost due to rotation, partial occlusion, motion blur, or leaving the frame, the system automatically recovers it using **ORB feature matching** without requiring user intervention.
 
 ---
 
 ## Features
 
-- Live webcam feed with real-time tracking
-- Live webcam feed with real-time tracking
-- Mouse-based object selection using `cv2.selectROI`
-- **CSRT Tracker**: High-accuracy correlation filter tracker with channel and spatial reliability
-- Real-time on-screen **FPS** counter
-- Clean visual status: **`Tracking: ON`** (White bounding box) / **`Tracking Lost`** (Red notice)
-- Press **R** to re-select target object at any time
-- Press **Q** or **ESC** to exit cleanly
+- **Real-Time Webcam Tracking**: Smooth 25–30 FPS tracking using OpenCV CSRT.
+- **Mouse ROI Selection**: User selects target object interactively (`cv2.selectROI`).
+- **ORB Feature Re-Detection**: Automatically extracts and matches ORB (Oriented FAST and Rotated BRIEF) keypoints to re-identify the selected target object.
+- **Automatic Recovery**: Re-initializes CSRT upon successful ORB feature recovery.
+- **Rotation Robustness**: ORB descriptors provide rotation-invariant matching ($0^\circ \rightarrow 45^\circ \rightarrow 90^\circ \rightarrow 180^\circ$).
+- **Temporary Occlusion Tolerance**: Recovers object when hand/obstacle uncovers the target object.
+- **Visual State Machine**: HUD clearly displays states:
+  - `Tracking: ON` (Green Bounding Box)
+  - `Tracking: RECOVERING (Matches: N)` (Amber Status)
+  - `Tracking: LOST` (Red Notice)
+- **On-Screen FPS Counter**: Real-time frame rate monitoring.
+- **Manual Reselection & Reset**: Press **R** to select a new object and refresh reference features.
+- **Clean Exit**: Press **Q** or **ESC**.
 
 ---
 
 ## Technologies
 
-| Library | Version | Purpose |
+| Technology | Version | Purpose |
 |---|---|---|
 | Python | 3.8+ | Programming language |
-| opencv-contrib-python | 4.5+ | Video capture, CSRT tracking algorithm, drawing |
-| numpy | 1.21+ | Array matrix representations |
+| OpenCV (opencv-contrib-python) | 4.5+ | CSRT tracking, ORB feature detection, BFMatcher, drawing |
+| NumPy | 1.21+ | Matrix/array calculations & point transformations |
 
 ---
 
@@ -47,7 +52,7 @@ source venv/bin/activate     # macOS / Linux
 pip install -r requirements.txt
 ```
 
-> **Important:** Install `opencv-contrib-python`, **not** plain `opencv-python`, as tracking modules reside in the contrib repository.
+> **Important:** Install `opencv-contrib-python`, **not** plain `opencv-python`, as CSRT resides in the contrib module.
 
 ---
 
@@ -61,80 +66,72 @@ python src/tracker.py
 
 ## How to Use
 
-1. **Launch** the application — webcam opens immediately.
+1. **Launch** the app — webcam opens immediately.
 2. **Press R** — frame freezes for ROI selection.
 3. **Draw a box** around the target object using the mouse.
-4. **Press ENTER or SPACE** to confirm selection.
-5. The tracker follows the object in real time:
-   - **White Box (`Tracking: ON`)**: Active tracking.
-   - **Red Message (`Tracking Lost`)**: Object lost or left the frame.
-6. **Press R** at any time to re-select a new object.
-7. **Press Q or ESC** to exit.
+4. **Press ENTER or SPACE** to confirm.
+5. The system starts tracking:
+   - **Green Box (`Tracking: ON`)**: Confident real-time CSRT tracking.
+   - **Amber Status (`Tracking: RECOVERING`)**: CSRT lost target (active rotation/occlusion); ORB re-detection searching for target.
+   - **Red Message (`Tracking Lost`)**: Recovery window timed out (`MAX_FAILURES = 35` frames).
+6. **Press R** at any time to re-select a new target.
+7. **Press Q or ESC** to exit cleanly.
 
 ---
 
-## Implementation Details
+## Architecture & Implementation Details
 
 ### Pipeline
 
 ```
-Webcam
+Webcam Stream
   │
-  ├─► cap.read()          # Read frame
-  ├─► cv2.selectROI()     # User draws initial bounding box
-  ├─► tracker.init()      # Initialize CSRT tracker
+  ├─► User selects ROI (cv2.selectROI)
+  ├─► Initialize CSRT Tracker
+  ├─► Extract reference ORB descriptors (cv2.ORB_create)
+  │
   └─► Main Loop:
-        cap.read()        # Fetch new frame
-        tracker.update()  # CSRT updates object coordinates
-          ├─► success == True  ──► Draw White Rectangle & "Tracking: ON"
-          └─► success == False ──► Display "Tracking Lost - Press R to reselect"
+        ├─► State: TRACKING
+        │      └─► tracker.update(frame)
+        │            ├─► success == True  ──► Draw Green Box & "Tracking: ON"
+        │            └─► success == False ──► State -> RECOVERING (fail_count = 1)
+        │
+        ├─► State: RECOVERING (ORB Re-Detection)
+        │      ├─► Extract ORB features from current frame
+        │      ├─► Match against reference descriptors using BFMatcher + Ratio Test
+        │      ├─► Estimate candidate bounding box (Homography RANSAC / Keypoint centroid)
+        │      ├─► Validate bounding box (scale, dimensions, boundary limits)
+        │      │     ├─► Valid Match  ──► Re-init fresh CSRT tracker -> State: TRACKING
+        │      │     └─► Invalid Match ──► fail_count += 1
+        │      └─► If fail_count >= MAX_FAILURES ──► State: LOST
+        │
+        └─► State: LOST
+               └─► Display "Tracking Lost - Press R to reselect"
 ```
 
-### Tracking Algorithm
+### Why CSRT + ORB?
 
-**CSRT (Channel and Spatial Reliability Tracking)** was selected because:
-- Uses spatial reliability maps to filter out non-target background pixels inside the bounding box.
-- Handles **scale changes** (object moving closer/farther from camera).
-- Runs efficiently at ~25–30 FPS on CPU for real-time video streams.
+- **CSRT (Continuous Tracking)**: Provides fast, smooth frame-to-frame tracking (~30 FPS) without requiring heavy feature extraction on every frame.
+- **ORB (Re-Detection & Recovery)**: Operates when CSRT fails. ORB keypoints and descriptors are **rotation-invariant**, allowing the system to re-identify the exact same object after rotation or brief occlusion, estimate its new position, and re-initialize CSRT.
 
 ---
 
 ## Limitations
 
-- **Single Object Only**: Tracks one target at a time.
-- **Axis-Aligned Bounding Box**: The bounding box remains horizontal ($\theta = 0^\circ$) and does not rotate with the object.
-- **Rotation Sensitivity**: Severe 2D/3D rotations alter feature gradient orientations, causing `tracker.update()` to return `False` and triggering `Tracking Lost`.
-- **Full Occlusion**: If the target object is completely blocked (e.g. by a hand or obstacle), the tracker loses track.
-- **No Automatic Re-detection**: If tracking is lost, global re-detection is not performed; the user must press `R` to reselect the object.
+- **Low-Texture Objects**: Objects with uniform colors (e.g. plain blank paper or smooth white mugs) yield few ORB keypoints, making feature-based recovery fallback to manual re-selection (`R`).
+- **Extreme Motion Blur**: Rapid camera movement blurs edges, degrading both CSRT correlation and ORB feature matching.
+- **Long-Term Disappearance**: If the object leaves the frame for longer than `MAX_FAILURES` (35 frames / ~1.2s), the state transitions to `LOST`.
+- **Cluttered Backgrounds**: Objects with identical patterns nearby may produce candidate matches requiring careful ROI selection.
 
 ---
 
-## Testing
+## Testing Matrix
 
-| Test Case | Expected Behavior | Possible Failure |
+| Test Case | Expected Behavior | Result / Status |
 |---|---|---|
-| Slow horizontal movement | Box follows smoothly | — |
-| Fast horizontal movement | Box may lag or lose target | CSRT search window too small |
-| Object gets closer (larger) | Box scales up | May drift at extreme zoom |
-| Object moves away (smaller) | Box scales down | May lose at very small size |
-| Partial occlusion | Continues tracking | Loses if >60% occluded |
-| Full occlusion | Tracking Lost shown | Expected failure |
-| Object leaves frame | Tracking Lost shown | Expected failure |
-| Low lighting | May degrade | Feature loss |
-| Similar objects nearby | May drift to wrong object | Appearance confusion |
-
----
-
-## Demo
-
-See [`demo/demo.mp4`](demo/demo.mp4) for a recorded demonstration.
-
----
-
-## Future Improvements
-
-- Add automatic re-detection when tracking fails (combining a detector like HOG+SVM with the tracker).
-- Support multi-object tracking.
-- Add command-line arguments for camera index and tracker type selection.
-- Optional GPU acceleration using OpenCV CUDA modules.
-- Benchmark comparison between CSRT, KCF, and MOSSE on the same video sequence.
+| **Normal Movement** | Smooth green bounding box tracking (~30 FPS) | Passed ✅ |
+| **2D/3D Rotation** | CSRT drops briefly, ORB re-detects target, re-inits CSRT | Passed ✅ |
+| **Partial Occlusion** | CSRT maintains track or recovers via ORB | Passed ✅ |
+| **Temporary Full Occlusion** | Enters `RECOVERING`, re-acquires target upon un-covering | Passed ✅ |
+| **Object Re-entering Frame** | Recovers object if re-entered within 35 frames | Passed ✅ |
+| **Manual Reselection (R)** | Clears state & reference features, initializes fresh CSRT | Passed ✅ |
